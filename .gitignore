@@ -1,218 +1,352 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import differential_evolution, minimize
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider, RadioButtons, Button, CheckButtons
+import os
+import json
 
-# C extensions
-*.so
+# ================= 🟢 KNOWN LAB PARAMETERS 🟢 =================
+G_GRAVITY = 9.81         
+MU_DENSITY = 0.01143     # چگالی خطی طناب آزمایشگاه (kg/m)
+FOLDER_PATH = r"c:\Users\Gaming 15\Documents\python"
+CACHE_FILE = os.path.join(FOLDER_PATH, "lab_settings.json")
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# Global cache memories
+video_cache = {}
+video_offsets = {} 
+global_selection_states = [True] * 10 
+tf = 15.0 
+t_exp, x_exp = None, None
 
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# --- سیستم ذخیره‌سازی دائمی برای حفظ فیت‌ها ---
+def save_settings():
+    try:
+        serializable = {k: v.tolist() for k, v in video_cache.items()}
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(serializable, f, indent=4)
+    except Exception as e:
+        print(f"⚠️ Error saving cache to disk: {e}")
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+def load_settings():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                data = json.load(f)
+                for k, v in data.items():
+                    video_cache[k] = np.array(v)
+            print("💾 تنظیمات و فیت‌های قبلی با موفقیت لود شدند.")
+        except Exception as e:
+            print(f"⚠️ فایل کش لود نشد: {e}")
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+# 1. ODE System - مدل فیزیکی رفت و برگشت
+def ode_system_y(t, state, omega_sq, gamma, alpha1, alpha2):
+    y, v = state
+    denom = 1.0 + gamma * y
+    if denom < 0.05: denom = 0.05
+        
+    # درگ همیشه مخالف جهت سرعت حرکت اعمال می‌شود
+    if v > 0:
+        acc = (-omega_sq * y - alpha1 * (v ** 2)) / denom
+    else:
+        acc = (-omega_sq * y + alpha2 * (v ** 2)) / denom
+        
+    return [v, acc]
 
-# Translations
-*.mo
-*.pot
+# --- تابع کمکی محاسباتی برای یافتن زمان دقیق نیم‌تناوب اول ---
+def compute_half_period(omega_sq, gamma, alpha1, alpha2, yinit, max_t):
+    t_eval = np.linspace(0.0, max_t, 4000)
+    sol = solve_ivp(ode_system_y, [0.0, max_t], [yinit, 0.0], 
+                    args=(omega_sq, gamma, alpha1, alpha2), 
+                    t_eval=t_eval, method='RK45')
+    if not sol.success:
+        return None
+    v = sol.y[1]
+    t = sol.t
+    
+    # پیدا کردن اولین جایی که سرعت بعد از شروع حرکت صفر می‌شود (تغییر علامت می‌دهد)
+    idx = np.where(t > 0.08)[0]
+    for i in idx[:-1]:
+        if v[i] * v[i+1] <= 0:
+            # درون‌یابی خطی برای یافتن زمان دقیق ریشه سرعت
+            t_zero = t[i] - v[i] * (t[i+1] - t[i]) / (v[i+1] - v[i])
+            return t_zero
+    return None
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+# ================= UI and Plot Setup =================
+fig, ax = plt.subplots(figsize=(14, 8))
+plt.subplots_adjust(left=0.25, bottom=0.45, right=0.95, top=0.9)
 
-# Flask stuff:
-instance/
-.webassets-cache
+ax_radio = plt.axes([0.02, 0.68, 0.18, 0.25])
+ax_radio.set_facecolor('#f7f7f7')
+ax_radio.text(0.5, 0.92, "Select Active Video", fontsize=9, weight='bold', ha='center', transform=ax_radio.transAxes)
+video_labels = [f"Video {i}" for i in range(1, 11)]
+radio = RadioButtons(ax_radio, video_labels, active=0, activecolor='#1f77b4')
 
-# Scrapy stuff:
-.scrapy
+exp_line, = ax.plot([], [], 'ro', markersize=2.5, label='Experiment (Tracker Data)')
+theory_line, = ax.plot([], [], 'b-', linewidth=2, label='Theory (Simulation)')
+ax.legend(loc='upper right')
+ax.grid(True, linestyle='--', alpha=0.5)
 
-# Sphinx documentation
-docs/_build/
+# 🛠️ اصلاح اساسی لودر برای فیلتر کردن هوشمند فریم‌های آسیب‌دیده نرم‌افزار Tracker
+def load_and_update_plot(video_name):
+    global t_exp, x_exp, tf
+    video_num = video_name.split()[1]
+    filename = os.path.join(FOLDER_PATH, f"tracker_data_{video_num}.txt")
+    
+    if os.path.exists(filename):
+        try:
+            t_list, x1_list, x2_list = [], [], []
+            has_col2 = False
+            
+            with open(filename, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()[2:]  # رد کردن دو خط هدر هدر Tracker
+                for line in lines:
+                    parts = []
+                    for token in line.strip().split():
+                        cleaned = ''.join(c for c in token if c in '0123456789.-+eE')
+                        if cleaned:
+                            try:
+                                parts.append(float(cleaned))
+                            except ValueError:
+                                pass
+                    # فقط در صورتی فریم ذخیره می‌شود که هم زمان و هم مکان ثبت شده باشد
+                    if len(parts) >= 2:
+                        t_list.append(parts[0])
+                        x1_list.append(parts[1])
+                        if len(parts) >= 3:
+                            x2_list.append(parts[2])
+                            has_col2 = True
+                        else:
+                            x2_list.append(0.0)
+            
+            if not t_list:
+                raise ValueError("فایل مورد نظر فاقد داده‌های عددی معتبر است.")
+                
+            t_exp = np.array(t_list)
+            if has_col2:
+                col1_var = np.var(x1_list)
+                col2_var = np.var(x2_list)
+                raw_x = np.array(x1_list) if col1_var > col2_var else np.array(x2_list)
+            else:
+                raw_x = np.array(x1_list)
+            
+            tail_idx = int(len(raw_x) * 0.8)
+            detected_offset = np.mean(raw_x[tail_idx:])
+            x_exp = raw_x - detected_offset
+            
+            video_offsets[video_name] = abs(detected_offset)
+            tf = float(max(t_exp)) 
+            exp_line.set_data(t_exp, x_exp)
+            ax.set_title(f'Advanced Physics Engine [⚡ Optimized Fit] - {video_name}', fontsize=14, pad=15)
+            
+            s_yinit.valmin = x_exp[0] - 0.1
+            s_yinit.valmax = x_exp[0] + 0.1
+            
+            if video_name in video_cache:
+                update_sliders_ui(video_cache[video_name])
+                update_theory()
+            else:
+                run_optimization(precise_mode=False)
+                
+        except Exception as e:
+            print(f"⚠️ خطای پردازش فایل فیلترشده: {e}")
+            t_exp, x_exp = None, None
+    else:
+        print(f"❌ فایل پیدا نشد: {filename}")
+        t_exp, x_exp = None, None
+        update_theory()
 
-# PyBuilder
-.pybuilder/
-target/
+def update_sliders_ui(opt):
+    sliders = [s_omega_sq, s_gamma, s_alpha1, s_alpha2, s_yinit, s_toff, s_yeq]
+    for i, s in enumerate(sliders):
+        s.eventson = False
+        s.set_val(opt[i])
+        s.eventson = True
 
-# Jupyter Notebook
-.ipynb_checkpoints
+def update_theory(val=None):
+    if t_exp is None or x_exp is None: return
+    
+    current_vid = radio.value_selected
+    video_cache[current_vid] = np.array([s_omega_sq.val, s_gamma.val, s_alpha1.val, s_alpha2.val, s_yinit.val, s_toff.val, s_yeq.val])
+    save_settings()
+    
+    t_eval = np.linspace(0.0, tf, 2000)
+    sol = solve_ivp(ode_system_y, [0.0, tf], [s_yinit.val, 0.0], 
+                    args=(s_omega_sq.val, s_gamma.val, s_alpha1.val, s_alpha2.val), 
+                    t_eval=t_eval, method='RK45', max_step=0.01)
+    
+    if sol.success:
+        theory_line.set_data(sol.t + s_toff.val, sol.y[0] + s_yeq.val)
+        ax.set_xlim(0.0, tf)
+        ax.set_ylim(min(x_exp) - 0.05, max(x_exp) + 0.05)
+            
+    fig.canvas.draw_idle()
 
-# IPython
-profile_default/
-ipython_config.py
+def run_optimization(precise_mode=False):
+    if t_exp is None or x_exp is None: return
+    current_vid = radio.value_selected
+    
+    max_iter = 80 if precise_mode else 10
+    pop_size = 12 if precise_mode else 4
+    
+    # ⚡ بهینه‌سازی سرعت: استفاده از متد سریع‌تر RK23 و تلرانس منعطف در حین محاسبات بهینه‌سازی
+    def loss_function(params):
+        sol = solve_ivp(ode_system_y, [0.0, tf], [params[4], 0.0], 
+                        args=(params[0], params[1], params[2], params[3]), 
+                        method='RK23', rtol=1e-4, atol=1e-4)
+        if not sol.success: return 1e6
+        x_pred = np.interp(t_exp, sol.t + params[5], sol.y[0], left=params[4], right=0.0) + params[6]
+        return np.mean((x_exp - x_pred) ** 2)
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    bounds = [(0.2, 1.6), (0.01, 0.8), (0.0, 16.0), (0.0, 16.0), (x_exp[0]-0.05, x_exp[0]+0.05), (-0.15, 0.15), (-0.05, 0.05)]
+    
+    res_global = differential_evolution(loss_function, bounds=bounds, strategy='best1bin', maxiter=max_iter, popsize=pop_size, polish=False)
+    res_local = minimize(loss_function, x0=res_global.x, bounds=bounds, method='L-BFGS-B', tol=1e-5)
+    
+    video_cache[current_vid] = res_local.x
+    save_settings()
+    update_sliders_ui(res_local.x)
+    update_theory()
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
+# --- Sliders Layout Configuration ---
+ax_omega = plt.axes([0.35, 0.35, 0.55, 0.02])
+ax_gamma = plt.axes([0.35, 0.30, 0.55, 0.02])
+ax_alpha1 = plt.axes([0.35, 0.25, 0.55, 0.02])
+ax_alpha2 = plt.axes([0.35, 0.20, 0.55, 0.02])
+ax_toff = plt.axes([0.35, 0.15, 0.55, 0.02])
+ax_yinit = plt.axes([0.35, 0.10, 0.55, 0.02])
+ax_yeq = plt.axes([0.35, 0.05, 0.55, 0.02])
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
+s_omega_sq = Slider(ax_omega, 'w^2', 0.2, 1.6, valinit=0.9, valfmt='%1.3f')
+s_gamma = Slider(ax_gamma, 'Gamma (g)', 0.01, 0.8, valinit=0.1, valfmt='%1.3f')
+s_alpha1 = Slider(ax_alpha1, 'Alpha 1 (a1)', 0.0, 16.0, valinit=1.0, valfmt='%1.3f') 
+s_alpha2 = Slider(ax_alpha2, 'Alpha 2 (a2)', 0.0, 16.0, valinit=1.0, valfmt='%1.3f') 
+s_toff = Slider(ax_toff, 't_off', -0.15, 0.15, valinit=0.0, valfmt='%1.3f') 
+s_yinit = Slider(ax_yinit, 'y(0)', -1.2, 1.2, valinit=-0.38, valfmt='%1.3f') 
+s_yeq = Slider(ax_yeq, 'y_eq', -0.05, 0.05, valinit=0.0, valfmt='%1.3f') 
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
+for s in [s_omega_sq, s_gamma, s_alpha1, s_alpha2, s_yinit, s_toff, s_yeq]:
+    s.on_changed(update_theory)
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
+# --- Action Buttons Layout ---
+ax_btn_fast = plt.axes([0.02, 0.29, 0.18, 0.04])
+btn_fast = Button(ax_btn_fast, '⚡ Fast Fit')
+btn_fast.on_clicked(lambda e: run_optimization(precise_mode=False))
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+ax_btn_precise = plt.axes([0.02, 0.24, 0.18, 0.04])
+btn_precise = Button(ax_btn_precise, '🎯 High-Precision')
+btn_precise.on_clicked(lambda e: run_optimization(True))
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+# --- Report Analysis Function ---
+def analyze_current_fit(event):
+    current_vid = radio.value_selected
+    if current_vid not in video_cache:
+        print("⚠️ Please fit the current video first.")
+        return
+        
+    params = video_cache[current_vid]
+    gamma = params[1]
+    L0 = video_offsets.get(current_vid, 0.3) 
+    
+    m1 = MU_DENSITY / gamma if gamma > 0.001 else 0.0
+    balloon_mass = (m1 - (MU_DENSITY * L0)) * 1000
+    
+    table_data = [
+        ["Parameter", "Calculated Value"],
+        ["Active Video", str(current_vid)],
+        ["Omega Squared (w^2)", f"{params[0]:.4f}"],
+        ["Gamma", f"{gamma:.4f}"],
+        ["Initial Position y(0)", f"{params[4]:.3f} m"],
+        ["Balloon Net Mass (m)", f"{balloon_mass:.2f} g"]
+    ]
+    
+    fig_pop, ax_pop = plt.subplots(figsize=(6, 3.5))
+    ax_pop.axis('off')
+    ax_pop.set_title(f"Experimental Report - {current_vid}", fontsize=12, weight='bold', pad=10)
+    ax_pop.table(cellText=table_data, loc='center', cellLoc='center', colWidths=[0.45, 0.45])
+    plt.tight_layout()
+    plt.show()
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+ax_btn_ana = plt.axes([0.02, 0.18, 0.18, 0.04])
+btn_analyze = Button(ax_btn_ana, 'Run Report Analysis')
+btn_analyze.on_clicked(analyze_current_fit)
 
-# Redis
-*.rdb
-*.aof
-*.pid
+# --- 📊 پیاده‌سازی کامل دکمه آنالیز کلی روی ویدیوهای علامت‌خورده 📊 ---
+def calculate_global_analysis(event):
+    print("📈 Extracting and calculating exact physical values from selected videos...")
+    
+    headers = ["Video", "Balloon Mass (g)", "Linear Density (g/m)", "Initial y(0) (m)", "1st Half-Period (s)"]
+    table_rows = []
+    
+    for i in range(10):
+        v_name = f"Video {i+1}"
+        if global_selection_states[i]:  # فقط ویدیوهایی که چک‌باکس آن‌ها علامت خورده است
+            if v_name in video_cache:
+                params = video_cache[v_name]
+                omega_sq, gamma, alpha1, alpha2, yinit, toff, yeq = params
+                L0 = video_offsets.get(v_name, 0.3)
+                
+                # استخراج جرم واقعی بادکنک بر اساس مدل جرم متغیر طناب آزمایشگاه
+                m1 = MU_DENSITY / gamma if gamma > 0.001 else float('inf')
+                m_balloon_g = (m1 - MU_DENSITY * L0) * 1000
+                
+                # محاسبه دقیق زمان نیم‌تناوب اول به روش عددی
+                t_half = compute_half_period(omega_sq, gamma, alpha1, alpha2, yinit, tf)
+                t_half_str = f"{t_half:.3f}" if t_half is not None else "N/A"
+                
+                table_rows.append([
+                    f"Video {i+1}",
+                    f"{m_balloon_g:.2f}" if m1 != float('inf') else "N/A",
+                    f"{MU_DENSITY * 1000:.2f}",
+                    f"{yinit:.3f}",
+                    t_half_str
+                ])
+            else:
+                print(f"⚠️ {v_name} انتخاب شده ولی دیتای فیت شده ندارد. نادیده گرفته شد.")
+                
+    if not table_rows:
+        print("❌ هیچ ویدیوی فیت‌شده‌ای در چک‌باکس‌ها انتخاب نشده است!")
+        return
 
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
+    # نمایش نتایج استخراج شده در قالب یک جدول مجزا و شیک برای گزارش کار
+    fig_global, ax_global = plt.subplots(figsize=(10, 4.5))
+    ax_global.axis('off')
+    fig_global.suptitle("Global Parameters Extraction Dashboard", fontsize=13, weight='bold', y=0.95)
+    
+    all_table_data = [headers] + table_rows
+    tab = ax_global.table(cellText=all_table_data, loc='center', cellLoc='center', 
+                          colWidths=[0.12, 0.22, 0.24, 0.20, 0.22])
+    tab.auto_set_font_size(False)
+    tab.set_fontsize(10)
+    
+    # رنگ‌آمیزی هدر جدول برای خوانایی عالی
+    for col_idx in range(len(headers)):
+        cell = tab[(0, col_idx)]
+        cell.set_facecolor('#1f77b4')
+        cell.get_text().set_color('white')
+        cell.get_text().set_weight('bold')
+        
+    plt.tight_layout()
+    plt.show()
 
-# ActiveMQ
-activemq-data/
+ax_btn_glob = plt.axes([0.02, 0.12, 0.18, 0.04])
+btn_global_ana = Button(ax_btn_glob, 'Global Analysis')
+btn_global_ana.on_clicked(calculate_global_analysis)
 
-# SageMath parsed files
-*.sage.py
+# --- CheckButtons Layout ---
+ax_check = plt.axes([0.02, 0.35, 0.18, 0.26])
+ax_check.set_facecolor('#f7f7f7')
+check_box = CheckButtons(ax_check, [f"V {i}" for i in range(1, 11)], global_selection_states)
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+def handle_checkbox_toggle(label):
+    idx = int(label.split()[1]) - 1
+    global_selection_states[idx] = not global_selection_states[idx]
 
-# Spyder project settings
-.spyderproject
-.spyproject
+check_box.on_clicked(handle_checkbox_toggle)
+radio.on_clicked(load_and_update_plot)
 
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
-
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
-
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#   you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
-.pypirc
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
-
-# Streamlit
-.streamlit/secrets.toml
+# ================= 🚀 EXECUTION START 🚀 =================
+load_settings()             
+load_and_update_plot("Video 1")  
+plt.show()
